@@ -154,6 +154,17 @@ parser.add_argument('--seed', default=0, type=int, help='manual seed')
 parser.add_argument('--tag', type=str, default='')
 parser.add_argument('--log_off', action='store_true')
 
+
+parser.add_argument('--kd', type=str2bool, default=False, help='whether to use knowledge distillation, uses model_t for teacher model')
+parser.add_argument('--model_t', type=str, default=None, help='model architecture for computing unary')
+
+#KD related shit
+parser.add_argument('--temp', type=float, default=1, help='Temperature for KD')
+parser.add_argument('--bce_weight', type=float, default=0, help = 'weightage for the BCE loss')
+parser.add_argument('--kl_weight', type=float, default=1, help = 'weightage for the KL loss')
+
+#uncertainty measure to be used
+parser.add_argument('--uncertainty', type=str, default='entropy', help = 'student uncertainty measure to be used')
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 
@@ -171,7 +182,11 @@ def define_exp_name(args=args):
     '''
     function for experiment result folder name.
     '''
-    exp_name = args.dataset
+    if args.kd:
+        exp_name = "KD_T[{}]_[CE W:{}]_[KL W:{}]_".format(args.model_t, args.bce_weight, args.kl_weight)
+    else:
+        exp_name = ""
+    exp_name += args.dataset
     exp_name += '_per_' + str(args.labels_per_class)
     exp_name += '_arch_' + str(args.arch)
     exp_name += '_eph_' + str(args.epochs)
@@ -190,6 +205,8 @@ def define_exp_name(args=args):
     exp_name += '_seed_' + str(args.seed)
     if args.tag != '':
         exp_name += '_' + str(args.tag)
+    if args.uncertainty != None:
+        exp_name += '_uncertainty_' + args.uncertainty
 
     return exp_name
 
@@ -243,6 +260,11 @@ def accuracy(output, target, topk=(1, )):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
+def kld_loss(out_s, out_t, T):
+    log_s_probs = torch.log_softmax(out_s/T, dim=1)
+    t_probs = torch.softmax(out_t/T, dim=1)
+    return F.kl_div(log_s_probs, t_probs, reduction='batchmean') * T*T
+
 
 bce_loss = nn.BCELoss().cuda()
 bce_loss_sum = nn.BCELoss(reduction='sum').cuda()
@@ -251,7 +273,7 @@ criterion = nn.CrossEntropyLoss().cuda()
 criterion_batch = nn.CrossEntropyLoss(reduction='none').cuda()
 
 
-def train(train_loader, model, optimizer, epoch, args, log, mpp=None):
+def train(train_loader, model, optimizer, epoch, args, log, mpp=None, model_t=None):
     '''train given model and dataloader'''
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -262,7 +284,12 @@ def train(train_loader, model, optimizer, epoch, args, log, mpp=None):
 
     # switch to train mode
     model.train()
-
+    
+    # set the teacher mode to eval mode
+    if model_t is not None:
+        model_t.eval()
+        
+        
     end = time.time()
     for input, target in train_loader:
         data_time.update(time.time() - end)
@@ -276,7 +303,14 @@ def train(train_loader, model, optimizer, epoch, args, log, mpp=None):
         if not args.comix:
             target_reweighted = to_one_hot(target, args.num_classes)
             output = model(input)
-            loss = bce_loss(softmax(output), target_reweighted)
+            
+            with torch.no_grad():
+                out_t = model_t(input)
+                
+            if args.kd:
+                loss = args.bce_weight*bce_loss(softmax(output), target_reweighted) + args.kl_weight*kld_loss(out_s=output, out_t=out_t, T=args.temp)
+            else:
+                loss = bce_loss(softmax(output), target_reweighted)
 
         # train with Co-Mixup images
         else:
@@ -331,10 +365,18 @@ def train(train_loader, model, optimizer, epoch, args, log, mpp=None):
                                                        args=args,
                                                        sc=sc,
                                                        A_dist=A_dist)
-
-            out = model(out)
-            loss = bce_loss(softmax(out), target_reweighted)
-
+            # get the student labels for the batch
+            out_s = model(out)
+            
+            # get the teacher labels for the batch
+            out_t = model_t(out)
+            
+            
+            if args.kd:
+                loss = args.bce_weight*bce_loss(softmax(out_s), target_reweighted) + args.kl_weight*kld_loss(out_s=out_s, out_t=out_t, T=args.temp)
+            else:
+                loss = bce_loss(softmax(out), target_reweighted)
+                
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
@@ -455,7 +497,8 @@ def main():
 
     # Create model
     print_log("=> creating model '{}'".format(args.arch), log)
-    net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+    #! net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+    net = models.__dict__[args.arch](num_classes=num_classes).cuda()
     args.num_classes = num_classes
 
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
@@ -472,6 +515,19 @@ def main():
 
     recorder = RecorderMeter(args.epochs)
 
+    # loading the teacher supervision model
+    if args.kd:
+        print_log("=> loading teacher model '{}'".format(args.model_t), log)
+        model_t = models.__dict__[args.model_t](num_classes=num_classes).cuda()
+        model_t.load_state_dict(torch.load('./pretrained_checkpoint/{}/ckpt/best.pth'.format(args.model_t))['state_dict'])
+        model_t = torch.nn.DataParallel(model_t, device_ids=list(range(args.ngpu)))
+        model_t.eval()
+        
+        _, _ = validate(test_loader, model_t, log)
+    else:
+        print_log("=> not using KD mode so *NO* teacher model loaded!", log)
+        model_t = None
+    
     # Optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -508,11 +564,11 @@ def main():
 
         need_hour, need_mins, need_secs = convert_secs2time(epoch_time.avg * (args.epochs - epoch))
         need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
-        print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
+        print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:.16e}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
                 + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # Train for one epoch
-        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mpp)
+        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mpp, model_t)
 
         # Evaluate on validation set
         val_acc, val_los = validate(test_loader, net, log)
