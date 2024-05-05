@@ -95,14 +95,37 @@ class MixupProcessWorker:
         self.worker.deamon = True
         self.worker.start()
 
+    # def start(self,
+    #           out: torch.Tensor,
+    #           target_reweighted: torch.Tensor,
+    #           hidden=0,
+    #           args=None,
+    #           sc: torch.Tensor = None,
+    #           A_dist: torch.Tensor = None,
+    #           debug=True):
+    #     self.q_input.put([out, target_reweighted, hidden, args, sc, A_dist, debug])
+        
     def start(self,
-              out: torch.Tensor,
-              target_reweighted: torch.Tensor,
-              hidden=0,
-              args=None,
-              sc: torch.Tensor = None,
-              A_dist: torch.Tensor = None,
-              debug=True):
+          out: torch.Tensor,
+          target_reweighted: torch.Tensor,
+          hidden=0,
+          args=None,
+          sc: torch.Tensor = None,
+          A_dist: torch.Tensor = None,
+          debug=True):
+        """Update code to fix the resize storage error
+
+        Args:
+            out (torch.Tensor): _description_
+            target_reweighted (torch.Tensor): _description_
+            hidden (int, optional): _description_. Defaults to 0.
+            args (_type_, optional): _description_. Defaults to None.
+            sc (torch.Tensor, optional): _description_. Defaults to None.
+            A_dist (torch.Tensor, optional): _description_. Defaults to None.
+            debug (bool, optional): _description_. Defaults to True.
+        """
+        out = out.clone()
+        target_reweighted = target_reweighted.clone()
         self.q_input.put([out, target_reweighted, hidden, args, sc, A_dist, debug])
 
     def join(self):
