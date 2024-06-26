@@ -115,7 +115,7 @@ def graphcut_multi(cost, beta=1, algorithm='swap', n_label=0, add_idx=None):
     return mask_idx
 
 
-def graphcut_wrapper(cost_penalty, label_count, n_input, height, width, beta, device, iter_idx=0):
+def graphcut_wrapper(cost_penalty, label_count, n_input, height, width, beta, device, uncertainty=0, iter_idx=0):
     '''Wrapper of graphcut_multi performing efficient extension to multi-label'''
     assigned_label = (label_count > 0)
     if iter_idx > 0:
@@ -127,7 +127,9 @@ def graphcut_wrapper(cost_penalty, label_count, n_input, height, width, beta, de
         cost_add = cost_penalty[:, :, assigned_label].mean(-1, keepdim=True) - 5e-4
         cost_penalty = torch.cat([cost_penalty, cost_add], dim=-1)
         unary = cost_penalty.cpu().numpy()
-
+        if uncertainty>0:
+            unary += uncertainty * np.random.randn(*unary.shape)
+            
         mask_idx_np = graphcut_multi(unary,
                                      beta=beta,
                                      n_label=2,
